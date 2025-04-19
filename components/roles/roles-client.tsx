@@ -3,20 +3,13 @@
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { toast } from "@/components/ui/use-toast"
-import { RoleRecommendations } from "@/components/roles/role-recommendations"
 import { Loader2, AlertCircle } from "lucide-react"
 import { supabase } from "@/lib/supabase"
 import { useAuth } from "@/context/auth-context"
 import { Button } from "@/components/ui/button"
-
-// Define the recommendation interface
-export interface RoleRecommendation {
-  id?: number
-  role_title: string
-  description: string
-  why_it_fits_professionally: string
-  why_it_fits_personally: string
-}
+import { RoleRecommendationsDisplay } from "@/components/roles/role-recommendations-display"
+import { RoleRecommendation, defaultRecommendations } from "@/lib/azure-recommendations"
+import { getRecommendations } from "@/lib/recommendation-service"
 
 export function RolesClient() {
   const [isLoading, setIsLoading] = useState(true)
@@ -39,139 +32,35 @@ export function RolesClient() {
         setIsLoading(true)
         setError(null)
 
-        // Check if we already have stored recommendations for this user
-        const { data: existingData, error: existingError } = await supabase
-          .from("role_recommendations")
-          .select("*")
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false })
-          .limit(3)
-          
-        // If we have existing recommendations, use them
-        if (!existingError && existingData && existingData.length > 0) {
-          console.log("Using existing recommendations from database");
-          setRecommendations(existingData.map(item => ({
-            id: item.id,
-            role_title: item.role_title,
-            description: item.description,
-            why_it_fits_professionally: item.why_it_fits_professionally,
-            why_it_fits_personally: item.why_it_fits_personally,
-          })));
-          setIsLoading(false);
-          return;
-        }
-
-        // Otherwise, call our API to generate new recommendations
-        console.log("Generating new recommendations from Azure OpenAI");
-        const response = await fetch('/api/recommendations', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ userId: user.id }),
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || 'Failed to fetch recommendations');
-        }
-
-        const data = await response.json();
-        
-        // Store recommendations in state
-        const recommendationsWithIds = data.recommendations.map((rec: RoleRecommendation, index: number) => ({
-          ...rec,
-          id: index + 1
-        }));
-        
-        setRecommendations(recommendationsWithIds);
-
-        // Store the new recommendations in Supabase for future use
-        for (const rec of recommendationsWithIds) {
-          await supabase.from("role_recommendations").insert({
-            user_id: user.id,
-            role_title: rec.role_title,
-            description: rec.description,
-            why_it_fits_professionally: rec.why_it_fits_professionally,
-            why_it_fits_personally: rec.why_it_fits_personally
-          });
-        }
-
-      } catch (error) {
-        console.error("Error fetching recommendations:", error);
-        setError(error instanceof Error ? error.message : "Failed to load recommendations");
-        // Use fallback data in case of error
-        setRecommendations([
-          {
-            id: 1,
-            role_title: "Software Developer",
-            description: "Software developers create applications and systems that run on computers and other devices. They design, code, test, and maintain software solutions across various industries.",
-            why_it_fits_professionally: "Based on your skills and background, software development allows you to leverage your analytical thinking and problem-solving abilities. Your interest in technology and logic-based work aligns well with this career path.",
-            why_it_fits_personally: "Your preference for creative problem-solving and building things makes software development a good match. It offers the intellectual challenges you enjoy while providing opportunities for continuous learning."
-          },
-          {
-            id: 2,
-            role_title: "Data Analyst",
-            description: "Data analysts collect, process, and analyze data to help organizations make better decisions. They work with large datasets to identify trends, create visualizations, and generate insights.",
-            why_it_fits_professionally: "Your analytical skills and attention to detail would be valuable assets in data analysis. Your background demonstrates comfort with numbers and logical reasoning needed in this field.",
-            why_it_fits_personally: "Your interest in understanding patterns and solving complex problems aligns well with data analysis. This role provides the opportunity to make a meaningful impact through data-driven insights."
-          },
-          {
-            id: 3,
-            role_title: "Product Manager",
-            description: "Product managers oversee the development and strategy of products throughout their lifecycle. They work across teams to ensure products meet market needs and business objectives.",
-            why_it_fits_professionally: "Your combination of technical understanding and communication skills is ideal for product management. Your experience demonstrates the ability to collaborate and think strategically.",
-            why_it_fits_personally: "Your interest in both technology and business makes product management a natural fit. This role combines creative thinking with strategic planning, matching your desire for varied and impactful work."
-          }
-        ]);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    fetchRecommendations();
-  }, [user]);
-
-  const handleSelectRole = async (role: RoleRecommendation) => {
-    if (!user) {
-      toast({
-        title: "Not logged in",
-        description: "Please log in to select a role",
-        variant: "destructive",
-      })
-      return
-    }
-
-    try {
-      // Update the role_selected field in the profiles table
-      const { error } = await supabase
-        .from("profiles")
-        .update({
-          role_selected: role.role_title,
+        const roleRecommendations = await getRecommendations({
+          userId: user.id
         })
-        .eq("id", user.id)
-
-      if (error) {
-        throw error
+        
+        setRecommendations(roleRecommendations)
+      } catch (error) {
+        console.error("Error fetching recommendations:", error)
+        setError("Failed to load recommendations")
+      } finally {
+        setIsLoading(false)
       }
-
-      toast({
-        title: "Role selected",
-        description: `You've selected ${role.role_title} as your career path.`,
-      })
-
-      setSelectedRole(role)
-
-      // Redirect to roadmap
-      router.push("/roadmap")
-    } catch (error) {
-      console.error("Error in role selection:", error)
-      toast({
-        title: "Error",
-        description: "There was a problem processing your selection. Please try again.",
-        variant: "destructive",
-      })
     }
+
+    fetchRecommendations()
+  }, [user])
+
+  // If not logged in, show login prompt
+  if (!user) {
+    return (
+      <div className="flex flex-col items-center justify-center py-12">
+        <h2 className="text-2xl font-bold mb-4">Login Required</h2>
+        <p className="text-center mb-6">
+          Please log in to view your personalized role recommendations.
+        </p>
+        <Button onClick={() => router.push("/")}>
+          Return to Home
+        </Button>
+      </div>
+    )
   }
 
   if (isLoading) {
@@ -200,5 +89,34 @@ export function RolesClient() {
     )
   }
 
-  return <RoleRecommendations recommendations={recommendations} onSelectRole={handleSelectRole} isLoading={false} />
+  return (
+    <div className="max-w-6xl mx-auto">
+      <div className="mb-8">
+        <Button
+          variant="ghost"
+          className="flex items-center gap-2"
+          onClick={() => router.push("/discovery")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-4 w-4"
+          >
+            <path d="m12 19-7-7 7-7"></path>
+            <path d="M19 12H5"></path>
+          </svg>
+          Back to Discovery
+        </Button>
+      </div>
+
+      <RoleRecommendationsDisplay />
+    </div>
+  )
 }

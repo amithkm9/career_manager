@@ -3,6 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import ModelClient from "@azure-rest/ai-inference";
 import { AzureKeyCredential } from "@azure/core-auth";
+import { extractResumeText } from "@/lib/resume-extractor";
+import { 
+  defaultRecommendations, 
+  type RoleRecommendation 
+} from "@/lib/azure-recommendations";
 
 // Initialize Supabase client
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL as string;
@@ -19,32 +24,13 @@ const client = new ModelClient(
   new AzureKeyCredential(azureInferenceKey)
 );
 
-// Default recommendations to use as fallback
-const defaultRecommendations = [
-  {
-    "role_title": "Software Developer",
-    "description": "Software developers create applications and systems that run on computers and other devices. They design, code, test, and maintain software solutions for various problems and needs.",
-    "why_it_fits_professionally": "Your technical skills and problem-solving abilities would make you a strong candidate for software development roles. Your experience with analytical thinking aligns well with the core competencies needed.",
-    "why_it_fits_personally": "Your interest in creating solutions and solving complex problems makes software development a fulfilling career path that matches your personal interests."
-  },
-  {
-    "role_title": "Data Analyst",
-    "description": "Data analysts examine datasets to identify trends and draw conclusions. They present findings to help organizations make better business decisions.",
-    "why_it_fits_professionally": "Your analytical thinking skills and attention to detail would serve you well as a data analyst. This role leverages your abilities to find patterns and insights in complex information.",
-    "why_it_fits_personally": "Your curiosity and interest in uncovering insights from information makes data analysis a personally satisfying career that aligns with your values."
-  },
-  {
-    "role_title": "Product Manager",
-    "description": "Product managers oversee the development of products from conception to launch. They define product strategy, gather requirements, and coordinate with different teams to ensure successful delivery.",
-    "why_it_fits_professionally": "Your combination of technical understanding and strategic planning abilities makes product management a good professional fit. This role utilizes both your analytical and communication skills.",
-    "why_it_fits_personally": "Your interest in both the business and technical aspects of products, along with your desire to create meaningful solutions, aligns well with product management."
-  }
-];
+// Mistral API Key for resume extraction
+const mistralApiKey = process.env.MISTRAL_API_KEY as string;
 
 export async function POST(request: NextRequest) {
   try {
-    // Get user ID from request body
-    const { userId } = await request.json();
+    // Get request data
+    const { userId, resumeUrl } = await request.json();
 
     if (!userId) {
       return NextResponse.json(
@@ -53,50 +39,79 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Variables to store our data
+    let resumeText = '';
+    let discoveryData: any = null;
+
     // Fetch user profile data from Supabase
     const { data: profileData, error: profileError } = await supabase
       .from("profiles")
-      .select("discovery_data")
+      .select("discovery_data, resume_link")
       .eq("id", userId)
       .single();
 
     if (profileError) {
       console.error("Error fetching profile data:", profileError);
+      // Continue with default values
+    } else {
+      discoveryData = profileData?.discovery_data;
+      
+      // If no resumeUrl was provided but user has one in profile, use that
+      if (!resumeUrl && profileData?.resume_link) {
+        resumeUrl = profileData.resume_link;
+      }
+    }
+
+    // Extract text from resume if URL is provided
+    if (resumeUrl) {
+      try {
+        console.log("Extracting text from resume:", resumeUrl);
+        resumeText = await extractResumeText(resumeUrl, mistralApiKey);
+        console.log("Successfully extracted text from resume");
+        
+        // Store the extracted text in Supabase (optional)
+        if (resumeText) {
+          await supabase
+            .from("profiles")
+            .update({ resume_text: resumeText })
+            .eq("id", userId);
+        }
+      } catch (error) {
+        console.error("Error extracting resume text:", error);
+        // Continue with empty resume text
+      }
+    }
+
+    // If no discovery data and no resume, return default recommendations
+    if (!discoveryData && !resumeText) {
+      console.log("No discovery data or resume for user, returning default recommendations");
       return NextResponse.json({ recommendations: defaultRecommendations });
     }
 
-    const discoveryData = profileData?.discovery_data;
-
-    // Instead of returning 404, return default recommendations if no discovery data
-    if (!discoveryData) {
-      console.log("No discovery data for user, returning default recommendations");
-      return NextResponse.json({ recommendations: defaultRecommendations });
-    }
-
-    // Prepare the prompt for Azure OpenAI
+    // Prepare the data for Azure OpenAI
     const formattedData = {
       skills: {
-        selected: discoveryData.skills.selected,
-        additional_info: discoveryData.skills.additional_info
+        selected: discoveryData?.skills?.selected || [],
+        additional_info: discoveryData?.skills?.additional_info || ""
       },
       values: {
-        selected: discoveryData.values.selected,
-        additional_info: discoveryData.values.additional_info
+        selected: discoveryData?.values?.selected || [],
+        additional_info: discoveryData?.values?.additional_info || ""
       },
       interests: {
-        selected: discoveryData.interests.selected,
-        additional_info: discoveryData.interests.additional_info
+        selected: discoveryData?.interests?.selected || [],
+        additional_info: discoveryData?.interests?.additional_info || ""
       },
-      timestamp: discoveryData.timestamp,
+      timestamp: discoveryData?.timestamp || new Date().toISOString(),
       "Resume Summary": {
-        skills: [], // If available, parse from CV 
-        projects: [], // If available, parse from CV
-        experiences: [], // If available, parse from CV
-        education: {} // If available, parse from CV
+        skills: [], // If available, could parse from CV
+        projects: [], // If available, could parse from CV
+        experiences: [], // If available, could parse from CV
+        education: {} // If available, could parse from CV
       }
     };
 
-    // Create the request for Azure OpenAI
+    // Create the prompt for Azure OpenAI
     const messages = [
       {
         role: "system",
@@ -138,11 +153,15 @@ export async function POST(request: NextRequest) {
           Skills: ${JSON.stringify(formattedData.skills)}
           Interests: ${JSON.stringify(formattedData.interests)}
           Values: ${JSON.stringify(formattedData.values)}
+          ${resumeText ? `Resume Text: ${resumeText}` : ''}
           
           Remember, I need ONLY the JSON array with 3 career recommendations, nothing else.`
       },
     ];
 
+    // Generate role recommendations
+    let roleRecommendations: RoleRecommendation[] = defaultRecommendations;
+    
     try {
       // Make the API call to Azure OpenAI
       const response = await client.path("chat/completions").post({
@@ -159,7 +178,6 @@ export async function POST(request: NextRequest) {
       }
 
       // Parse the response
-      let roleRecommendations;
       try {
         const responseContent = response.body.choices[0].message.content;
         console.log("Raw response from Azure OpenAI:", responseContent);
@@ -192,6 +210,18 @@ export async function POST(request: NextRequest) {
             throw new Error("Response is not an array or object");
           }
         }
+        
+        // Store recommendations in Supabase
+        for (const rec of roleRecommendations) {
+          await supabase.from("role_recommendations").insert({
+            user_id: userId,
+            role_title: rec.role_title,
+            description: rec.description,
+            why_it_fits_professionally: rec.why_it_fits_professionally,
+            why_it_fits_personally: rec.why_it_fits_personally
+          });
+        }
+        
       } catch (error) {
         console.error("Error parsing Azure OpenAI response:", error);
         console.error("Response content:", response.body.choices[0].message.content);
@@ -199,17 +229,20 @@ export async function POST(request: NextRequest) {
         // Return fallback recommendations
         roleRecommendations = defaultRecommendations;
       }
-
-      // Return the recommendations
-      return NextResponse.json({ recommendations: roleRecommendations });
       
-    } catch (apiError) {
-      console.error("Error calling Azure OpenAI:", apiError);
-      return NextResponse.json({ recommendations: defaultRecommendations });
+    } catch (error) {
+      console.error("Error calling Azure OpenAI:", error);
+      roleRecommendations = defaultRecommendations;
     }
-    
+
+    // Return the recommendations
+    return NextResponse.json({ recommendations: roleRecommendations });
+      
   } catch (error) {
     console.error("Error in API route:", error);
-    return NextResponse.json({ recommendations: defaultRecommendations });
+    return NextResponse.json(
+      { error: "Server error", recommendations: defaultRecommendations },
+      { status: 500 }
+    );
   }
 }
